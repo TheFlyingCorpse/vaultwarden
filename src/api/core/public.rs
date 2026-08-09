@@ -15,16 +15,16 @@ use crate::{
     db::{
         DbConn,
         models::{
-            Collection, CollectionGroup, CollectionId, CollectionUser, EventType, Group, GroupId, GroupUser,
+            Collection, CollectionGroup, CollectionId, CollectionUser, Event, EventType, Group, GroupId, GroupUser,
             Invitation, Membership, MembershipId, MembershipStatus, MembershipType, OrgPolicy, Organization,
             OrganizationApiKey, OrganizationId, User,
         },
     },
     mail,
-    util::NumberOrString,
+    util::{NumberOrString, parse_date},
 };
 
-use super::events::log_public_event;
+use super::events::{EventRange, get_continuation_token, log_public_event};
 
 pub fn routes() -> Vec<Route> {
     routes![
@@ -48,6 +48,7 @@ pub fn routes() -> Vec<Route> {
         put_group,
         delete_group,
         put_group_member_ids,
+        get_events,
     ]
 }
 
@@ -1006,6 +1007,40 @@ async fn put_group_member_ids(
     }
 
     Ok(())
+}
+
+// Upstream: https://github.com/bitwarden/server/blob/9ebe16587175b1c0e9208f84397bb75d0d595510/src/Api/AdminConsole/Public/Controllers/EventsController.cs
+// Exposes the organization event log to an organization-scoped API client. The
+// same data is otherwise only reachable through the internal API, which requires
+// an admin user session instead of an organization API key.
+#[get("/public/events?<data..>")]
+async fn get_events(data: EventRange, token: PublicToken, conn: DbConn) -> JsonResult {
+    let org_id = token.0;
+
+    // Return an empty vec when the org events are disabled.
+    // This prevents client errors
+    let events_json: Vec<Value> = if CONFIG.org_events_enabled() {
+        let start_date = parse_date(&data.start);
+        let end_date = if let Some(before_date) = &data.continuation_token {
+            parse_date(before_date)
+        } else {
+            parse_date(&data.end)
+        };
+
+        Event::find_by_organization_uuid(&org_id, &start_date, &end_date, &conn)
+            .await
+            .iter()
+            .map(Event::to_json)
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    Ok(Json(json!({
+        "object": "list",
+        "data": events_json,
+        "continuationToken": get_continuation_token(&events_json),
+    })))
 }
 
 pub struct PublicToken(OrganizationId);
