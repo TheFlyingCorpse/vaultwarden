@@ -21,7 +21,7 @@ use crate::{
         },
     },
     mail,
-    util::{NumberOrString, parse_date},
+    util::{NumberOrString, parse_date_checked},
 };
 
 use super::events::{EventRange, get_continuation_token, log_public_event};
@@ -1020,11 +1020,14 @@ async fn get_events(data: EventRange, token: PublicToken, conn: DbConn) -> JsonR
     // Return an empty vec when the org events are disabled.
     // This prevents client errors
     let events_json: Vec<Value> = if CONFIG.org_events_enabled() {
-        let start_date = parse_date(&data.start);
-        let end_date = if let Some(before_date) = &data.continuation_token {
-            parse_date(before_date)
-        } else {
-            parse_date(&data.end)
+        // These come straight from the query string, so they must not be parsed with
+        // parse_date(), which panics on anything that is not a valid RFC 3339 date.
+        let Some(start_date) = parse_date_checked(&data.start) else {
+            err!("Invalid start date")
+        };
+        let end = data.continuation_token.as_deref().unwrap_or(&data.end);
+        let Some(end_date) = parse_date_checked(end) else {
+            err!("Invalid end date")
         };
 
         Event::find_by_organization_uuid(&org_id, &start_date, &end_date, &conn)
