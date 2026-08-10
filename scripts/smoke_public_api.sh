@@ -307,6 +307,17 @@ jqcheck "members omit groups by default" '.data[0] | has("groups")' "false"
 
 req GET "/api/public/members?includeGroups=true" "$TOKEN"
 check_eq "members with includeGroups -> 200" "$HTTP_CODE" "200"
+
+# A value the flag parser does not understand must be rejected, not silently treated as
+# false. A caller reading an empty groups list as "nobody is in any group" would unassign
+# everyone, so a quiet default here is worse than an error.
+req GET "/api/public/members?includeGroups=1" "$TOKEN"
+check_eq "includeGroups=1 is accepted -> 200" "$HTTP_CODE" "200"
+jqcheck "includeGroups=1 really includes them" '.data[0] | has("groups")' "true"
+req GET "/api/public/members?includeGroups=banana" "$TOKEN"
+check_eq "an unparsable includeGroups is rejected -> 400" "$HTTP_CODE" "400"
+
+req GET "/api/public/members?includeGroups=true" "$TOKEN"
 jqcheck "members carry their group ids" '.data[0].groups | length' "1"
 jqcheck "member group id" '.data[0].groups[0]' "$GROUP"
 

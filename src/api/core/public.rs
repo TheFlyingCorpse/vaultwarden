@@ -324,13 +324,21 @@ fn collection_to_json(collection: &Collection) -> Value {
 #[derive(FromForm)]
 struct GetMembersData {
     #[field(name = "includeGroups")]
-    include_groups: Option<bool>,
+    include_groups: Option<String>,
 }
 
 #[get("/public/members?<data..>")]
 async fn get_members(data: GetMembersData, token: PublicToken, conn: DbConn) -> JsonResult {
     let org_id = token.0;
-    let include_groups = data.include_groups.unwrap_or(false);
+    // Rocket's Option<bool> form parser yields None for a value it cannot parse rather than
+    // failing, so "includeGroups=1" would quietly come back with no groups at all. A client
+    // reading that as "nobody is in any group" would unassign everyone, so reject it instead.
+    let include_groups = match data.include_groups.as_deref() {
+        None => false,
+        Some(v) if v.eq_ignore_ascii_case("true") || v == "1" => true,
+        Some(v) if v.eq_ignore_ascii_case("false") || v == "0" => false,
+        Some(v) => err!(format!("Invalid includeGroups value: {v}")),
+    };
     let mut members_json = Vec::new();
     for member in Membership::find_by_org(&org_id, &conn).await {
         let mut entry = member_to_json(&member, &conn).await;
