@@ -48,6 +48,8 @@ pub fn routes() -> Vec<Route> {
         put_group,
         delete_group,
         put_group_member_ids,
+        put_collection,
+        delete_collection,
     ]
 }
 
@@ -315,6 +317,38 @@ fn collection_to_json(collection: &Collection) -> Value {
     })
 }
 
+// Upstream includes each group's collection associations in the group list, unlike the
+// member and collection lists which deliberately omit theirs.
+async fn group_collections_json(group_id: &GroupId, org_id: &OrganizationId, conn: &DbConn) -> Vec<Value> {
+    CollectionGroup::find_by_group(group_id, org_id, conn)
+        .await
+        .iter()
+        .map(|c| {
+            json!({
+                "id": c.collections_uuid,
+                "readOnly": c.read_only,
+                "hidePasswords": c.hide_passwords,
+                "manage": c.manage,
+            })
+        })
+        .collect()
+}
+
+async fn collection_groups_json(collection_id: &CollectionId, conn: &DbConn) -> Vec<Value> {
+    CollectionGroup::find_by_collection(collection_id, conn)
+        .await
+        .iter()
+        .map(|c| {
+            json!({
+                "id": c.groups_uuid,
+                "readOnly": c.read_only,
+                "hidePasswords": c.hide_passwords,
+                "manage": c.manage,
+            })
+        })
+        .collect()
+}
+
 #[get("/public/members")]
 async fn get_members(token: PublicToken, conn: DbConn) -> JsonResult {
     let org_id = token.0;
@@ -374,7 +408,12 @@ async fn get_member_group_ids(member_id: MembershipId, token: PublicToken, conn:
 #[get("/public/groups")]
 async fn get_groups(token: PublicToken, conn: DbConn) -> JsonResult {
     let org_id = token.0;
-    let groups_json: Vec<Value> = Group::find_by_organization(&org_id, &conn).await.iter().map(group_to_json).collect();
+    let mut groups_json = Vec::new();
+    for group in Group::find_by_organization(&org_id, &conn).await {
+        let mut entry = group_to_json(&group);
+        entry["collections"] = json!(group_collections_json(&group.uuid, &org_id, &conn).await);
+        groups_json.push(entry);
+    }
 
     Ok(Json(json!({
         "object": "list",
@@ -390,21 +429,8 @@ async fn get_group(group_id: GroupId, token: PublicToken, conn: DbConn) -> JsonR
         err_code!(format!("Group {group_id} not found in organization"), 404);
     };
 
-    let collections: Vec<Value> = CollectionGroup::find_by_group(&group_id, &org_id, &conn)
-        .await
-        .iter()
-        .map(|c| {
-            json!({
-                "id": c.collections_uuid,
-                "readOnly": c.read_only,
-                "hidePasswords": c.hide_passwords,
-                "manage": c.manage,
-            })
-        })
-        .collect();
-
     let mut group_json = group_to_json(&group);
-    group_json["collections"] = json!(collections);
+    group_json["collections"] = json!(group_collections_json(&group_id, &org_id, &conn).await);
 
     Ok(Json(group_json))
 }
@@ -446,21 +472,8 @@ async fn get_collection(collection_id: CollectionId, token: PublicToken, conn: D
         err_code!(format!("Collection {collection_id} not found in organization"), 404);
     };
 
-    let groups: Vec<Value> = CollectionGroup::find_by_collection(&collection_id, &conn)
-        .await
-        .iter()
-        .map(|c| {
-            json!({
-                "id": c.groups_uuid,
-                "readOnly": c.read_only,
-                "hidePasswords": c.hide_passwords,
-                "manage": c.manage,
-            })
-        })
-        .collect();
-
     let mut collection_json = collection_to_json(&collection);
-    collection_json["groups"] = json!(groups);
+    collection_json["groups"] = json!(collection_groups_json(&collection_id, &conn).await);
 
     Ok(Json(collection_json))
 }
@@ -1063,6 +1076,94 @@ async fn put_group_member_ids(
     }
 
     Ok(())
+}
+
+// A collection's associations are keyed by group id, so this cannot reuse AssociationData.
+// Upstream has no user associations on the collection model.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GroupAssociationData {
+    id: GroupId,
+    #[serde(default)]
+    read_only: bool,
+    #[serde(default)]
+    hide_passwords: bool,
+    #[serde(default)]
+    manage: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CollectionUpdateData {
+    external_id: Option<String>,
+    // Absent leaves the associations alone, the same as an absent groups list on a member.
+    groups: Option<Vec<GroupAssociationData>>,
+}
+
+// There is no create endpoint: a collection name is end-to-end encrypted ciphertext the
+// server cannot produce, so upstream only exposes update and delete.
+#[put("/public/collections/<collection_id>", data = "<data>")]
+async fn put_collection(
+    collection_id: CollectionId,
+    data: Json<CollectionUpdateData>,
+    token: PublicToken,
+    ip: auth::ClientIp,
+    conn: DbConn,
+) -> JsonResult {
+    let org_id = token.0;
+    let Some(mut collection) = Collection::find_by_uuid_and_org(&collection_id, &org_id, &conn).await else {
+        err_code!(format!("Collection {collection_id} not found in organization"), 404);
+    };
+
+    let data = data.into_inner();
+
+    if let Some(groups) = &data.groups {
+        let group_ids: Vec<GroupId> = groups.iter().map(|g| g.id.clone()).collect();
+        validate_groups(&group_ids, &org_id, &conn).await?;
+    }
+
+    if data.external_id.is_some() {
+        collection.set_external_id(data.external_id.clone());
+        collection.save(&conn).await?;
+    }
+
+    if let Some(groups) = &data.groups {
+        CollectionGroup::delete_all_by_collection(&collection_id, &org_id, &conn).await?;
+        for group in groups {
+            let mut collection_group = CollectionGroup::new(
+                collection_id.clone(),
+                group.id.clone(),
+                group.read_only,
+                group.hide_passwords,
+                group.manage,
+            );
+            collection_group.save(&org_id, &conn).await?;
+        }
+    }
+
+    log_public_event(EventType::CollectionUpdated as i32, &collection.uuid, &org_id, &ip.ip, &conn).await;
+
+    let mut collection_json = collection_to_json(&collection);
+    collection_json["groups"] = json!(collection_groups_json(&collection_id, &conn).await);
+
+    Ok(Json(collection_json))
+}
+
+#[delete("/public/collections/<collection_id>")]
+async fn delete_collection(
+    collection_id: CollectionId,
+    token: PublicToken,
+    ip: auth::ClientIp,
+    conn: DbConn,
+) -> EmptyResult {
+    let org_id = token.0;
+    let Some(collection) = Collection::find_by_uuid_and_org(&collection_id, &org_id, &conn).await else {
+        err_code!(format!("Collection {collection_id} not found in organization"), 404);
+    };
+
+    log_public_event(EventType::CollectionDeleted as i32, &collection.uuid, &org_id, &ip.ip, &conn).await;
+
+    collection.delete(&conn).await
 }
 
 pub struct PublicToken(OrganizationId);
