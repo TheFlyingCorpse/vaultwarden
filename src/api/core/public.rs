@@ -1024,9 +1024,9 @@ async fn put_group(
 
     // Member assignments are owned by "/public/groups/<group_id>/member-ids" and are
     // deliberately left untouched here.
-    set_group_collections(&group, &data.collections, &org_id, &conn).await?;
-
     log_public_event(EventType::GroupUpdated as i32, &group.uuid, &org_id, &ip.ip, &conn).await;
+
+    set_group_collections(&group, &data.collections, &org_id, &conn).await?;
 
     Ok(Json(group_to_json(&group)))
 }
@@ -1118,6 +1118,9 @@ async fn put_collection(
     let data = data.into_inner();
 
     if let Some(groups) = &data.groups {
+        if !CONFIG.org_groups_enabled() {
+            err!("Group support is disabled");
+        }
         let group_ids: Vec<GroupId> = groups.iter().map(|g| g.id.clone()).collect();
         validate_groups(&group_ids, &org_id, &conn).await?;
     }
@@ -1126,6 +1129,8 @@ async fn put_collection(
         collection.set_external_id(data.external_id.clone());
         collection.save(&conn).await?;
     }
+
+    log_public_event(EventType::CollectionUpdated as i32, &collection.uuid, &org_id, &ip.ip, &conn).await;
 
     if let Some(groups) = &data.groups {
         CollectionGroup::delete_all_by_collection(&collection_id, &org_id, &conn).await?;
@@ -1140,8 +1145,6 @@ async fn put_collection(
             collection_group.save(&org_id, &conn).await?;
         }
     }
-
-    log_public_event(EventType::CollectionUpdated as i32, &collection.uuid, &org_id, &ip.ip, &conn).await;
 
     let mut collection_json = collection_to_json(&collection);
     collection_json["groups"] = json!(collection_groups_json(&collection_id, &conn).await);
