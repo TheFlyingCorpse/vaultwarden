@@ -298,6 +298,48 @@ req GET "/api/public/collections/$COLLECTION2" "$TOKEN"
 check_eq "cross-org collection -> 404" "$HTTP_CODE" "404"
 
 echo ""
+echo "== Member group ids in bulk =="
+
+# Without the flag the response must be unchanged, so a client written against the upstream
+# model sees exactly what it expects.
+req GET "/api/public/members" "$TOKEN"
+jqcheck "members omit groups by default" '.data[0] | has("groups")' "false"
+
+req GET "/api/public/members?includeGroups=true" "$TOKEN"
+check_eq "members with includeGroups -> 200" "$HTTP_CODE" "200"
+jqcheck "members carry their group ids" '.data[0].groups | length' "1"
+jqcheck "member group id" '.data[0].groups[0]' "$GROUP"
+
+echo ""
+echo "== The member list is not paged =="
+
+# Learning the membership map in one request only works if that request returns everyone.
+# There is no pagination here and continuationToken is always null, but if a page limit were
+# ever introduced a caller would read a partial map as complete and start correcting
+# memberships that were never wrong. Pin the contract so that change fails loudly.
+sqlite3 "$TMP/db.sqlite3" <<SQL
+WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 40)
+INSERT INTO users (uuid,enabled,created_at,updated_at,login_verify_count,email,name,password_hash,salt,password_iterations,akey,security_stamp,equivalent_domains,excluded_globals,client_kdf_type,client_kdf_iter)
+SELECT printf('u%07d-0000-4000-8000-00000000000b', n),1,'2026-01-01 00:00:00','2026-01-01 00:00:00',0,
+       printf('bulk%d@example.com', n),printf('Bulk %d', n),X'00',X'00',100000,'',printf('stamp-b%d', n),'[]','[]',0,100000
+FROM seq;
+
+WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 40)
+INSERT INTO users_organizations (uuid,user_uuid,org_uuid,invited_by_email,access_all,akey,status,atype,reset_password_key,external_id)
+SELECT printf('m%07d-0000-4000-8000-00000000000b', n),printf('u%07d-0000-4000-8000-00000000000b', n),'$ORG',NULL,0,'',2,2,NULL,printf('ext-bulk-%d', n)
+FROM seq;
+SQL
+
+req GET "/api/public/members" "$TOKEN"
+check_eq "large member list -> 200" "$HTTP_CODE" "200"
+jqcheck "every member is returned, not just a page" '.data | length' "41"
+jqcheck "and no continuation token is offered" '.continuationToken' "null"
+
+req GET "/api/public/members?includeGroups=true" "$TOKEN"
+jqcheck "includeGroups covers the whole list" '.data | length' "41"
+jqcheck "includeGroups offers no continuation token either" '.continuationToken' "null"
+
+echo ""
 echo "== Authentication required =="
 req GET "/api/public/members"
 check_eq "no token -> 401" "$HTTP_CODE" "401"

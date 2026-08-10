@@ -350,12 +350,31 @@ async fn collection_groups_json(collection_id: &CollectionId, conn: &DbConn) -> 
         .collect()
 }
 
-#[get("/public/members")]
-async fn get_members(token: PublicToken, conn: DbConn) -> JsonResult {
+// Upstream has no way to learn the member-to-group edge in bulk: it is only reachable one
+// group at a time through "/public/groups/<group_id>/member-ids", which costs a request per
+// group. This optional flag mirrors the internal "/organizations/<org_id>/users" endpoint,
+// which already accepts includeGroups, and returns the whole edge in a single request. It is
+// additive: without it the response is unchanged, so a client written against upstream sees
+// exactly what it expects.
+#[derive(FromForm)]
+struct GetMembersData {
+    #[field(name = "includeGroups")]
+    include_groups: Option<bool>,
+}
+
+#[get("/public/members?<data..>")]
+async fn get_members(data: GetMembersData, token: PublicToken, conn: DbConn) -> JsonResult {
     let org_id = token.0;
+    let include_groups = data.include_groups.unwrap_or(false);
     let mut members_json = Vec::new();
     for member in Membership::find_by_org(&org_id, &conn).await {
-        members_json.push(member_to_json(&member, &conn).await);
+        let mut entry = member_to_json(&member, &conn).await;
+        if include_groups {
+            let group_ids: Vec<GroupId> =
+                GroupUser::find_by_member(&member.uuid, &conn).await.into_iter().map(|gu| gu.groups_uuid).collect();
+            entry["groups"] = json!(group_ids);
+        }
+        members_json.push(entry);
     }
 
     Ok(Json(json!({
