@@ -32,6 +32,7 @@ pub fn routes() -> Vec<Route> {
         get_members,
         get_member,
         get_member_group_ids,
+        get_member_public_key,
         get_groups,
         get_group,
         get_group_member_ids,
@@ -42,6 +43,7 @@ pub fn routes() -> Vec<Route> {
         delete_member,
         put_member_group_ids,
         post_member_reinvite,
+        post_member_confirm,
         post_member_revoke,
         post_member_restore,
         post_group,
@@ -433,6 +435,35 @@ async fn get_member_group_ids(member_id: MembershipId, token: PublicToken, conn:
     Ok(Json(json!(group_ids)))
 }
 
+// Confirming a member means handing them the organization key encrypted with their own
+// public key, and only the caller can perform that encryption. A Public API client is not a
+// user, so it cannot reach the internal "/users/<user_id>/public-key" endpoint to look the
+// key up. Expose it here instead, scoped to the members of the token's organization.
+#[get("/public/members/<member_id>/public-key")]
+async fn get_member_public_key(member_id: MembershipId, token: PublicToken, conn: DbConn) -> JsonResult {
+    let org_id = token.0;
+    let Some(member) = Membership::find_by_uuid_and_org(&member_id, &org_id, &conn).await else {
+        err_code!(format!("Member {member_id} not found in organization"), 404);
+    };
+
+    let Some(user) = User::find_by_uuid(&member.user_uuid, &conn).await else {
+        err_code!(format!("Member {member_id} has no user account"), 404);
+    };
+
+    // A member who was invited but never finished registering has no key pair yet, so there is
+    // nothing to confirm them with. The internal endpoint reports that as a 404 as well.
+    let Some(public_key) = user.public_key else {
+        err_code!(format!("Member {member_id} has no public key"), 404);
+    };
+
+    Ok(Json(json!({
+        "object": "memberPublicKey",
+        "id": member.uuid,
+        "userId": member.user_uuid,
+        "publicKey": public_key,
+    })))
+}
+
 #[get("/public/groups")]
 async fn get_groups(token: PublicToken, conn: DbConn) -> JsonResult {
     let org_id = token.0;
@@ -561,6 +592,15 @@ struct MemberUpdateData {
     // client is expected to send a read straight back, so null has to deserialize.
     #[serde(default)]
     permissions: Option<HashMap<String, Value>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MemberConfirmData {
+    // The organization key, encrypted with the member's public key. The internal endpoint
+    // takes this as an optional field because the web vault posts it in a bulk envelope; here
+    // there is nothing useful to do without it, so it is required.
+    key: String,
 }
 
 #[derive(Deserialize)]
@@ -939,6 +979,72 @@ async fn post_member_reinvite(member_id: MembershipId, token: PublicToken, conn:
         member.status = MembershipStatus::Accepted as i32;
         member.save(&conn).await?;
     }
+
+    Ok(())
+}
+
+// Move a member who has accepted their invite to confirmed, which is the point at which they
+// gain access to the organization's data. That access is a decryption key, not a flag: the
+// member reads the organization key out of this membership, so the caller has to send it
+// already encrypted with the member's public key. The server stores the organization key only
+// in that encrypted form and can never produce it, which is why the key is required here just
+// as it is on the internal endpoint. Read the key to encrypt against from
+// "/public/members/<member_id>/public-key".
+#[post("/public/members/<member_id>/confirm", data = "<data>")]
+async fn post_member_confirm(
+    member_id: MembershipId,
+    data: Json<MemberConfirmData>,
+    token: PublicToken,
+    ip: auth::ClientIp,
+    conn: DbConn,
+    nt: Notify<'_>,
+) -> EmptyResult {
+    let org_id = token.0;
+    let data = data.into_inner();
+
+    // Storing an empty key would confirm the member into an organization they cannot decrypt,
+    // and nothing later fills it in, so refuse it rather than create a broken membership.
+    if data.key.is_empty() {
+        err!("Key is not set, unable to process request")
+    }
+
+    let Some(mut member) = Membership::find_by_uuid_and_org(&member_id, &org_id, &conn).await else {
+        err_code!(format!("Member {member_id} not found in organization"), 404);
+    };
+
+    deny_owner_target(&member)?;
+
+    // Only an accepted invite can be confirmed. An invited member has not proven ownership of
+    // the address yet, and a confirmed one already holds a key that this would overwrite.
+    if member.status != MembershipStatus::Accepted as i32 {
+        err!("User in invalid state")
+    }
+
+    member.status = MembershipStatus::Confirmed as i32;
+    member.akey = data.key;
+
+    // This check is also done at accept_invite, _confirm_invite, _activate_member, edit_member,
+    // admin::update_membership_type. It needs to happen after confirming to see the correct status.
+    OrgPolicy::check_user_allowed(&member, "confirm", &conn).await?;
+
+    let Some(user) = User::find_by_uuid(&member.user_uuid, &conn).await else {
+        err!("Error looking up user")
+    };
+
+    // Mail goes out before the save, the same way the internal endpoint orders it. A dead mail
+    // server is far likelier than a failing write, and leaving the member unconfirmed so the
+    // call can simply be retried beats telling them they were let in when they were not.
+    if CONFIG.mail_enabled() {
+        let (org_name, _) = org_name_and_email(&org_id, &conn).await?;
+        mail::send_invite_confirmed(&user.email, &org_name).await?;
+    }
+
+    member.save(&conn).await?;
+
+    log_public_event(EventType::OrganizationUserConfirmed as i32, &member.uuid, &org_id, &ip.ip, &conn).await;
+
+    // There is no device behind a Public API request, so no push device to exclude.
+    nt.send_user_update(UpdateType::SyncOrgKeys, &user, None, &conn).await;
 
     Ok(())
 }
