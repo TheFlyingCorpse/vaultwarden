@@ -831,7 +831,7 @@ async fn post_member(data: Json<MemberCreateData>, token: PublicToken, ip: auth:
         err!(format!("Error sending invite: {e:?} "));
     }
 
-    log_public_event(EventType::OrganizationUserInvited as i32, &new_member.uuid, &org_id, &ip.ip, &conn).await;
+    log_public_event(EventType::OrganizationUserInvited, &new_member.uuid, &org_id, &ip.ip, &conn).await;
 
     set_member_collections(&new_member, &data.collections, &org_id, &conn).await?;
     set_member_groups(&new_member, &data.groups, &conn).await?;
@@ -883,7 +883,7 @@ async fn put_member(
 
     member.save(&conn).await?;
 
-    log_public_event(EventType::OrganizationUserUpdated as i32, &member.uuid, &org_id, &ip.ip, &conn).await;
+    log_public_event(EventType::OrganizationUserUpdated, &member.uuid, &org_id, &ip.ip, &conn).await;
 
     Ok(Json(member_to_json(&member, &conn).await))
 }
@@ -903,7 +903,7 @@ async fn delete_member(
 
     deny_owner_target(&member)?;
 
-    log_public_event(EventType::OrganizationUserRemoved as i32, &member.uuid, &org_id, &ip.ip, &conn).await;
+    log_public_event(EventType::OrganizationUserRemoved, &member.uuid, &org_id, &ip.ip, &conn).await;
 
     if let Some(user) = User::find_by_uuid(&member.user_uuid, &conn).await {
         // There is no device behind a Public API request, so no push device to exclude.
@@ -941,7 +941,7 @@ async fn put_member_group_ids(
 
     set_member_groups(&member, &data.group_ids, &conn).await?;
 
-    log_public_event(EventType::OrganizationUserUpdatedGroups as i32, &member.uuid, &org_id, &ip.ip, &conn).await;
+    log_public_event(EventType::OrganizationUserUpdatedGroups, &member.uuid, &org_id, &ip.ip, &conn).await;
 
     Ok(())
 }
@@ -1041,7 +1041,7 @@ async fn post_member_confirm(
 
     member.save(&conn).await?;
 
-    log_public_event(EventType::OrganizationUserConfirmed as i32, &member.uuid, &org_id, &ip.ip, &conn).await;
+    log_public_event(EventType::OrganizationUserConfirmed, &member.uuid, &org_id, &ip.ip, &conn).await;
 
     // There is no device behind a Public API request, so no push device to exclude.
     nt.send_user_update(UpdateType::SyncOrgKeys, &user, None, &conn).await;
@@ -1070,7 +1070,7 @@ async fn post_member_revoke(
     member.revoke();
     member.save(&conn).await?;
 
-    log_public_event(EventType::OrganizationUserRevoked as i32, &member.uuid, &org_id, &ip.ip, &conn).await;
+    log_public_event(EventType::OrganizationUserRevoked, &member.uuid, &org_id, &ip.ip, &conn).await;
 
     Ok(())
 }
@@ -1101,7 +1101,7 @@ async fn post_member_restore(
     OrgPolicy::check_user_allowed(&member, "restore", &conn).await?;
     member.save(&conn).await?;
 
-    log_public_event(EventType::OrganizationUserRestored as i32, &member.uuid, &org_id, &ip.ip, &conn).await;
+    log_public_event(EventType::OrganizationUserRestored, &member.uuid, &org_id, &ip.ip, &conn).await;
 
     Ok(())
 }
@@ -1125,7 +1125,7 @@ async fn post_group(
         Group::new(org_id.clone(), data.name.clone(), data.access_all.unwrap_or(false), data.external_id.clone());
     group.save(&conn).await?;
 
-    log_public_event(EventType::GroupCreated as i32, &group.uuid, &org_id, &ip.ip, &conn).await;
+    log_public_event(EventType::GroupCreated, &group.uuid, &org_id, &ip.ip, &conn).await;
 
     set_group_collections(&group, &data.collections, &org_id, &conn).await?;
 
@@ -1166,7 +1166,7 @@ async fn put_group(
 
     // Member assignments are owned by "/public/groups/<group_id>/member-ids" and are
     // deliberately left untouched here.
-    log_public_event(EventType::GroupUpdated as i32, &group.uuid, &org_id, &ip.ip, &conn).await;
+    log_public_event(EventType::GroupUpdated, &group.uuid, &org_id, &ip.ip, &conn).await;
 
     set_group_collections(&group, &data.collections, &org_id, &conn).await?;
 
@@ -1184,7 +1184,7 @@ async fn delete_group(group_id: GroupId, token: PublicToken, ip: auth::ClientIp,
         err_code!(format!("Group {group_id} not found in organization"), 404);
     };
 
-    log_public_event(EventType::GroupDeleted as i32, &group.uuid, &org_id, &ip.ip, &conn).await;
+    log_public_event(EventType::GroupDeleted, &group.uuid, &org_id, &ip.ip, &conn).await;
 
     group.delete(&org_id, &conn).await
 }
@@ -1214,7 +1214,7 @@ async fn put_group_member_ids(
         let mut user_entry = GroupUser::new(group_id.clone(), member_id.clone());
         user_entry.save(&conn).await?;
 
-        log_public_event(EventType::OrganizationUserUpdatedGroups as i32, member_id, &org_id, &ip.ip, &conn).await;
+        log_public_event(EventType::OrganizationUserUpdatedGroups, member_id, &org_id, &ip.ip, &conn).await;
     }
 
     Ok(())
@@ -1309,7 +1309,7 @@ async fn put_collection(
         collection.save(&conn).await?;
     }
 
-    log_public_event(EventType::CollectionUpdated as i32, &collection.uuid, &org_id, &ip.ip, &conn).await;
+    log_public_event(EventType::CollectionUpdated, &collection.uuid, &org_id, &ip.ip, &conn).await;
 
     if let Some(groups) = &data.groups {
         CollectionGroup::delete_all_by_collection(&collection_id, &org_id, &conn).await?;
@@ -1343,7 +1343,7 @@ async fn delete_collection(
         err_code!(format!("Collection {collection_id} not found in organization"), 404);
     };
 
-    log_public_event(EventType::CollectionDeleted as i32, &collection.uuid, &org_id, &ip.ip, &conn).await;
+    log_public_event(EventType::CollectionDeleted, &collection.uuid, &org_id, &ip.ip, &conn).await;
 
     collection.delete(&conn).await
 }
